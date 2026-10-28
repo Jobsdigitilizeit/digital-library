@@ -1,0 +1,21 @@
+rules_version = '2';
+
+// Course materials: only the owning lecturer uploads; verified, active users may download
+// (the Firestore `materials` rules decide who is ever shown a material and its URL).
+service firebase.storage {
+  match /b/{bucket}/o {
+    function fsUser() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+    match /materials/{uid}/{courseId}/{file} {
+      allow read: if request.auth != null && request.auth.token.email_verified == true
+                  && fsUser().status == 'active';
+      allow write: if request.auth != null && request.auth.uid == uid
+                   && request.auth.token.email_verified == true
+                   && fsUser().status == 'active' && fsUser().role == 'lecturer'
+                   && request.resource.size < 50 * 1024 * 1024
+                   && request.resource.contentType.matches('application/pdf|video/.*|image/.*|text/.*|application/(vnd\\..*|msword|zip)');
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

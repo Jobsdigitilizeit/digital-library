@@ -1,0 +1,201 @@
+rules_version = '2';
+
+// Role-based security rules. Roles live ONLY in users/{uid}.role, which a user can never
+// write to themselves except via two controlled paths: student self-activation (school email,
+// verified) or claiming an admin-issued invite for their own verified email.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function emailVerified() { return signedIn() && request.auth.token.email_verified == true; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    // Regulated university domains (and their subdomains). Keep in sync with src/config/institution.ts
+    function schoolEmail() {
+      return myEmail().matches('^[a-z0-9._%+-]+@([a-z0-9-]+\\.)*(up\\.ac\\.za|uj\\.ac\\.za|richfield\\.ac\\.za)$');
+    }
+    // Staff may also use these mail providers, but only through an administrator's invitation.
+    function staffDomain(email) {
+      return email.matches('^[a-z0-9._%+-]+@(([a-z0-9-]+\\.)*(up\\.ac\\.za|uj\\.ac\\.za|richfield\\.ac\\.za)|gmail\\.com|outlook\\.com|hotmail\\.com|live\\.com|yahoo\\.com|icloud\\.com)$');
+    }
+    function idPath(id) { return /databases/$(database)/documents/idRegistry/$(id.upper().replace('-', '')); }
+    // First administrator: this exact, verified email may claim the admin role without an invitation.
+    function bootstrapAdmin() { return myEmail() == 'monarengmarape4@gmail.com'; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function me() { return get(userPath(request.auth.uid)).data; }
+    function isActive() {
+      return emailVerified() && exists(userPath(request.auth.uid)) && me().status == 'active';
+    }
+    function hasRole(r) { return isActive() && me().role == r; }
+    function isAdmin() { return hasRole('admin'); }
+    function isStaff() { return isActive() && me().role in ['lecturer', 'librarian', 'admin']; }
+    function invPath(email) { return /databases/$(database)/documents/invites/$(email); }
+    function loanPath(rid) { return /databases/$(database)/documents/borrows/$(request.auth.uid + '_' + rid); }
+    function coursePath(cid) { return /databases/$(database)/documents/courses/$(cid); }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      // Anyone may create ONLY their own pending student profile. The email must be a school
+      // email, or an admin invite must exist for it (so invited staff on other domains can join).
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['id','name','email','role','status','department','level',
+             'studentOrStaffId','avatar','interests','bookmarkedResourceIds','offlineResourceIds',
+             'readingHistory','createdAt','loginCount'])
+        && request.resource.data.email == myEmail()
+        && request.resource.data.id == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.name is string && request.resource.data.name.size() <= 80
+        && (schoolEmail() || exists(invPath(myEmail())) || bootstrapAdmin())
+        // the student/staff number must be claimed in the same batch, and can only be claimed once
+        && getAfter(idPath(request.resource.data.studentOrStaffId)).data.uid == request.auth.uid;
+
+      allow update: if
+        // (a) active users edit harmless profile / presence fields only
+        (signedIn() && request.auth.uid == uid && resource.data.status == 'active' && emailVerified()
+          && changed().hasOnly(['name','avatar','interests','department','level',
+               'bookmarkedResourceIds','offlineResourceIds','readingHistory','lastLogin','lastSeen','loginCount']))
+        // (b) activation after email verification: student (school email) or invited staff
+        || (signedIn() && request.auth.uid == uid && emailVerified()
+          && resource.data.status == 'pending'
+          && changed().hasOnly(['status','role','activatedAt'])
+          && request.resource.data.status == 'active'
+          && ((request.resource.data.role == 'student' && resource.data.role == 'student' && schoolEmail())
+              || (exists(invPath(myEmail())) && request.resource.data.role == get(invPath(myEmail())).data.role)
+              || (bootstrapAdmin() && request.resource.data.role == 'admin')))
+        // (c) administrators manage others (never their own role/status, so they cannot lock themselves out)
+        || (isAdmin()
+          && changed().hasOnly(['role','status','name','department','level','statusReason'])
+          && (request.auth.uid != uid || !changed().hasAny(['role','status'])));
+    }
+
+    // ---------- invites (staff onboarding) ----------
+    match /invites/{email} {
+      allow read: if isAdmin() || (emailVerified() && myEmail() == email);
+      allow create, update: if isAdmin() && email == request.resource.data.email
+        && staffDomain(email)
+        && request.resource.data.role in ['lecturer','librarian','admin'];
+      allow delete: if isAdmin()
+        // the invitee consumes their own invite as part of activation
+        || (emailVerified() && myEmail() == email
+            && getAfter(userPath(request.auth.uid)).data.status == 'active'
+            && getAfter(userPath(request.auth.uid)).data.role == resource.data.role);
+    }
+
+    // ---------- student / staff number registry: detects duplicate registrations ----------
+    // Create-only: a number can be claimed exactly once, by its owner, and is never released or overwritten.
+    match /idRegistry/{key} {
+      allow get: if signedIn();
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid'])
+        && key.matches('^[A-Z0-9]{3,20}$');
+      allow update, delete: if false;
+    }
+
+    // ---------- security / activity logs (append-only) ----------
+    match /loginEvents/{id} {
+      allow create: if signedIn()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.at == request.time
+        && request.resource.data.type in ['login','logout','login_blocked'];
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+    match /auditLogs/{id} {
+      allow create: if isStaff()
+        && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.at == request.time;
+      allow read: if isAdmin();
+      allow update, delete: if false;
+    }
+    match /backups/{id} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    // ---------- catalogue ----------
+    match /resources/{id} {
+      allow read: if isActive();
+      allow create: if hasRole('librarian') || isAdmin()
+        || (hasRole('lecturer') && request.resource.data.verifiedByLibrarian == false);
+      allow update: if hasRole('librarian') || isAdmin()
+        // borrowing / returning moves the copy counter by exactly one, and only together with the matching loan write
+        || (isActive() && changed().hasOnly(['availableCopies'])
+            && request.resource.data.availableCopies >= 0
+            && request.resource.data.availableCopies <= resource.data.totalCopies
+            && (
+              (request.resource.data.availableCopies == resource.data.availableCopies - 1
+                && getAfter(loanPath(id)).data.status == 'active'
+                && (!exists(loanPath(id)) || get(loanPath(id)).data.status == 'returned'))
+              ||
+              (request.resource.data.availableCopies == resource.data.availableCopies + 1
+                && getAfter(loanPath(id)).data.status == 'returned'
+                && get(loanPath(id)).data.status in ['active','renewed','overdue'])
+            ));
+      allow delete: if hasRole('librarian') || isAdmin();
+    }
+
+    match /borrows/{id} {
+      allow read: if isActive() && (resource.data.userId == request.auth.uid || hasRole('librarian') || isAdmin());
+      allow create: if isAdmin() || (isActive()
+        && id == request.auth.uid + '_' + request.resource.data.resourceId
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'active');
+      allow update: if hasRole('librarian') || isAdmin()
+        || (isActive() && resource.data.userId == request.auth.uid
+            && request.resource.data.userId == request.auth.uid
+            && request.resource.data.resourceId == resource.data.resourceId
+            && (
+              (resource.data.status == 'returned' && request.resource.data.status == 'active')
+              || (resource.data.status in ['active','renewed','overdue'] && request.resource.data.status in ['returned','renewed'])
+            ));
+      allow delete: if isAdmin();
+    }
+
+    // ---------- courses, materials, enrolments ----------
+    match /courses/{id} {
+      allow read: if isActive()
+        && (resource.data.status == 'published' || resource.data.lecturerId == request.auth.uid
+            || hasRole('librarian') || isAdmin());
+      allow create: if isAdmin() || (hasRole('lecturer') && request.resource.data.lecturerId == request.auth.uid);
+      allow update: if (hasRole('lecturer') && resource.data.lecturerId == request.auth.uid
+                         && request.resource.data.lecturerId == request.auth.uid)
+        || isAdmin()
+        // librarians may only answer reading-list requests
+        || (hasRole('librarian') && changed().hasOnly(['readingList','updatedAt']));
+      allow delete: if (hasRole('lecturer') && resource.data.lecturerId == request.auth.uid) || isAdmin();
+    }
+
+    match /materials/{id} {
+      allow read: if isActive() && (
+        isAdmin() || hasRole('librarian')
+        || get(coursePath(resource.data.courseId)).data.lecturerId == request.auth.uid
+        || exists(/databases/$(database)/documents/enrollments/$(resource.data.courseId + '_' + request.auth.uid)));
+      allow create: if isAdmin() || (hasRole('lecturer')
+        && get(coursePath(request.resource.data.courseId)).data.lecturerId == request.auth.uid
+        && request.resource.data.uploadedBy == request.auth.uid);
+      allow update, delete: if hasRole('lecturer')
+        && get(coursePath(resource.data.courseId)).data.lecturerId == request.auth.uid;
+    }
+
+    match /enrollments/{id} {
+      allow read: if isActive() && (
+        resource.data.studentId == request.auth.uid || hasRole('librarian') || isAdmin()
+        || get(coursePath(resource.data.courseId)).data.lecturerId == request.auth.uid);
+      allow create: if isAdmin() || (hasRole('student')
+        && request.resource.data.studentId == request.auth.uid
+        && id == request.resource.data.courseId + '_' + request.auth.uid
+        && get(coursePath(request.resource.data.courseId)).data.status == 'published');
+      allow delete: if isActive() && (resource.data.studentId == request.auth.uid || isAdmin());
+      allow update: if false;
+    }
+
+    // everything else is denied
+    match /{document=**} { allow read, write: if false; }
+  }
+}

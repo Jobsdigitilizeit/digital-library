@@ -1,0 +1,6 @@
+{
+  "name": "AI Digital Library System",
+  "description": "An intelligent, centralized web-based digital library platform featuring AI-powered semantic search, personalized recommendations, automated resource classification, document AI study assistant, role-based access control, offline caching, and institutional analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
